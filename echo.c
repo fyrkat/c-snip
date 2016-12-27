@@ -1,165 +1,78 @@
-#define _POSIX_C_SOURCE 201112L
+/*
+ * Echo server
+ *
+ * Accepts tcp/ipv4 connections on port 8000
+ *
+ */
 
 #include <unistd.h>
 #include <stdlib.h>
 #include <stdio.h>
-#include <errno.h>
 
-#include <sys/types.h>
-#include <sys/socket.h>
-#include <netdb.h>
 #include <arpa/inet.h>
 
-#include <poll.h>
-
-#define MAX_CONNECTIONS 5
-
-int listen_socket;
-int connections[MAX_CONNECTIONS];
-int num_connections = 0;
+#include <ev.h>
 
 
-int get_listen_socket()
+#include "socket_get.h"
+
+static void echo_cb(EV_P_ ev_io *w, int revents);
+static void server_cb(EV_P_ ev_io *w, int revents);
+
+
+int  main()
 {
-	int listen_socket = socket(AF_INET, SOCK_STREAM, 0);
-	if (listen_socket < 0) {
-		perror("Error creating listening socket");
-		exit(1);
-	}
-	if (setsockopt(listen_socket, SOL_SOCKET, SO_REUSEADDR, &(int){ 1 }, sizeof(int)))
-		perror("setsockopt(SO_REUSEADDR) failed");
+	struct ev_loop *loop = EV_DEFAULT;
 
+	int listen_socket = get_server_socket("8000");
 
-	struct addrinfo hints = {
-		.ai_family = AF_INET,
-		.ai_socktype = SOCK_STREAM,
-		.ai_flags = AI_PASSIVE
-	};
+	ev_io server_watcher;
+	ev_io_init(&server_watcher, server_cb, listen_socket, EV_READ);
+	ev_io_start(loop, &server_watcher);
 
-	struct addrinfo * result = NULL;
-	int error = getaddrinfo(NULL, "8000", &hints, &result);
-	if (error) {
-		if (error == EAI_SYSTEM) {
-			perror("Error getting address info");
-		} else if (error) {
-			fprintf(stderr, "Error getting address info: %s\n", gai_strerror(error));
-		}
-		exit(1);
-	}
-	
-	for (struct addrinfo *rp = result; rp != NULL; rp = rp->ai_next) {
-		if (bind(listen_socket, rp->ai_addr, rp->ai_addrlen)) {
-			perror("Error binding an address");
-			exit(1);
-		} 
-	}
-	freeaddrinfo(result);
-	return listen_socket;
+	ev_run(loop, 0);
+	return 0;
 }
 
 
-void add_connection(int sock)
+static void
+server_cb(EV_P_ ev_io *w, int revents)
 {
-	if (num_connections < MAX_CONNECTIONS) {
-		fprintf(stderr, "Add connection\n");
-		connections[num_connections++] = sock;
-	} else {
-		fprintf(stderr, "Maximum number of connections reached (%d)\n", MAX_CONNECTIONS);
-		close(sock);
+	if ( !(revents & EV_READ) ) {
+		return;
 	}
-}
 
-void remove_connection(int sock)
-{
-	fprintf(stderr, "Remove socket %d\n", sock);
-	for (int i = 0; i < num_connections; ++i) {
-		if (connections[i] == sock) {
-			for (int j = i; j < num_connections; j++) {
-				connections[j] = connections[j+1];
-			}
-			num_connections--;
-			break;
-		}
-	}
-	close(sock);
-}
-
-
-void accept_connection(int sock)
-{
 	struct sockaddr_in address;
 	socklen_t address_len;
 
-	int conn = accept(sock, (struct sockaddr *) &address, &address_len);
+	int conn = accept(w->fd, (struct sockaddr *) &address, &address_len);
 	if (conn < 0) {
-		perror("Error accepting connection in accept_connection");
+		perror("Error accepting connection");
 	} else {
 		char ipaddr[INET_ADDRSTRLEN] = "";
 		inet_ntop(AF_INET, &(address.sin_addr.s_addr), ipaddr, INET_ADDRSTRLEN);
 		fprintf(stderr, "Got connection from %s on socket %d\n", ipaddr, conn);
-		add_connection(conn);
+
+		ev_io *watcher = malloc(sizeof(ev_io));
+		ev_io_init(watcher, echo_cb, conn, EV_READ);
+		ev_io_start(loop, watcher);
 	}
 }
 
 
-void echo(int sock)
+static void
+echo_cb(EV_P_ ev_io *w, int revents)
 {
-	fprintf(stderr, "Echoing socket %d\n", sock);
 	char buf[128];
-	int bytes_read = read(sock, buf, 128);
+	int bytes_read = read(w->fd, buf, 128);
 	if (bytes_read == 0) {
-		remove_connection(sock);
-	}
-	write(sock, buf, bytes_read);
-}
-
-
-void main_loop()
-{
-	static int loop_count = 0;
-	++loop_count;
-
-	fprintf(stderr, "Loop number: %d\n", loop_count);
-	fprintf(stderr, "Num open connections %d\n", num_connections);
-
-	int num_fds = num_connections + 1;
-	struct pollfd fds[num_fds];
-
-	fds[0].fd = listen_socket;
-	fds[0].events = POLLIN;
-	for (int i = 0; i < num_connections; ++i) {
-		fds[i+1].fd = connections[i];
-		fds[i+1].events = POLLIN | POLLHUP;
-	}
-
-	int rv = poll(fds, num_fds, 10000);
-	if (rv > 0) {
-		fprintf(stderr, "Got %d events\n", rv);
-
-		if (fds[0].revents & POLLIN) {
-			accept_connection(listen_socket);
-		}
-		for (int i = 1; i < num_fds; ++i) {
-			if (fds[i].revents & POLLIN) {
-				echo(fds[i].fd);
-			}
-		}
-	} else if (rv == 0) {
-		fprintf(stderr, "Poll timed out.\n");
+		fprintf(stderr, "Closing socket %d\n", w->fd);
+		ev_io_stop(loop, w);
+		close(w->fd);
+		free(w);
 	} else {
-		perror("Main loop poll error: %s\n");
+		fprintf(stderr, "Echoing socket %d\n", w->fd);
+		write(w->fd, buf, bytes_read);
 	}
 }
 
-int  main()
-{
-	listen_socket = get_listen_socket();
-	if (listen(listen_socket, 5)) {
-		perror("Listen");
-		exit(1);
-	}
-	for (;;) {
-		main_loop();
-	}
-	return 0;
-}
